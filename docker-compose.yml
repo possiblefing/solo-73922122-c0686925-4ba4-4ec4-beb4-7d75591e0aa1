@@ -1,0 +1,23 @@
+services:
+  proxy:
+    build: ./proxy
+    environment:
+      UPSTREAM_HOST: upstream
+      UPSTREAM_PORT: "8000"
+      LISTEN_HOST: 0.0.0.0
+      LISTEN_PORT: "8080"
+      LOG_LEVEL: INFO
+    ports:
+      - "8080:8080"
+    depends_on:
+      - upstream
+    restart: unless-stopped
+
+  upstream:
+    build: ./upstream
+    environment:
+      UPSTREAM_MAX_STORED: "200"
+    ports:
+      # 暴露到宿主机是为了演示时直接查看“上游实收请求”与 /docs
+      - "8000:8000"
+    restart: unless-stopped
