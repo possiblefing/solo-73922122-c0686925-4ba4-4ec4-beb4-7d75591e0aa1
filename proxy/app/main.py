@@ -5,9 +5,14 @@ HTTP/1.1 反向代理（asyncio + h11，单进程）
   * 仅放行 POST /events，其余请求拒绝并关闭入站连接；
   * 完整校验入站帧格式（重复 Content-Length、TE/CL 并存、非法分块、正文超限等），
     校验通过后丢弃原始分帧，重建单一 Content-Length 再转发；
+  * HMAC-SHA256 探针认证：头格式/时间窗口/签名先验，通过后在“首次写出前”
+    完成撤销复核与 nonce 原子持久消费，重放与已撤销探针一律拒绝；
   * 固定上游，连接池容量 2，每条连接同一时刻只处理一笔；
   * 从发送起总限 2 秒；超时 / 客户端断连即销毁上游连接，迟到响应不会交给下一调用者；
   * 只有完整收齐带 Content-Length 的响应才把连接归还连接池。
+
+nonce 一旦消费即不重发：消费发生在任何上游字节写出之前，之后的上游失败
+只回 5xx，绝不自动重试（避免同一事件被写出两次）。
 
 h11 是 sans-IO 解析器：它只负责字节 <-> 事件，所有 IO 与策略由本模块实现。
 """
@@ -23,6 +28,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 import h11
+
+from .auth_store import (
+    AuthStore,
+    NonceAlreadyConsumed,
+    ProbeRevoked,
+)
+from .config import ConfigError, load_config
+from .hmac_auth import (
+    AUTH_HEADERS,
+    AuthReject,
+    verify_request,
+)
 
 # --------------------------------------------------------------------------- #
 # 常量与配置
@@ -40,6 +57,11 @@ UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "upstream")
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8000"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
+# 与管理端（upstream 服务）共享的 SQLite 文件，compose 中挂同一命名卷。
+AUTH_DB_PATH = os.environ.get("AUTH_DB_PATH", "/data/auth.db")
+# nonce 记录保留期，仅用于后台清理；安全窗口由 30 秒时间戳偏差保证。
+NONCE_RETENTION_SECONDS = int(os.environ.get("NONCE_RETENTION_SECONDS", "3600"))
+PRUNE_INTERVAL_SECONDS = int(os.environ.get("PRUNE_INTERVAL_SECONDS", "600"))
 
 # RFC 7230 §6.1 逐跳头，禁止被代理转发；另含常见的非标准 Proxy-Connection。
 HOP_BY_HOP = frozenset(
@@ -191,14 +213,19 @@ async def exchange_upstream(
     target: bytes,
     headers: list[tuple[bytes, bytes]],
     body: bytes,
+    strip_auth: bool = False,
 ) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
     """在一条已获取的上游连接上完成一次完整的请求/响应交换。
 
     任何异常都意味着该连接可能处于帧错位状态，调用方必须销毁它，
     从而保证“迟到响应”绝不会被后续调用者读到。
+
+    strip_auth=True 时剥离 HMAC 认证头：签名材料只在代理侧使用，
+    上游业务服务看不到任何凭据材料。
     """
     # 重建单一 Content-Length，彻底剥离入站分块/歧义分帧。
-    out_headers = [(k, v) for k, v in headers if k.lower() not in HOP_BY_HOP]
+    drop = HOP_BY_HOP | (AUTH_HEADERS if strip_auth else frozenset())
+    out_headers = [(k, v) for k, v in headers if k.lower() not in drop]
     out_headers.append((b"content-length", str(len(body)).encode("ascii")))
     out_headers.append((b"host", f"{UPSTREAM_HOST}:{UPSTREAM_PORT}".encode("ascii")))
 
@@ -356,8 +383,10 @@ async def _silent_await_cancel(task: asyncio.Task) -> None:
 
 
 class InboundProtocol(asyncio.Protocol):
-    def __init__(self, pool: UpstreamPool):
+    def __init__(self, pool: UpstreamPool, config, store: AuthStore):
         self._pool = pool
+        self._config = config
+        self._store = store
         self._h11 = h11.Connection(
             h11.SERVER, max_incomplete_event_size=MAX_BODY)
         self._queue: asyncio.Queue = asyncio.Queue(READ_QUEUE_HWM)
@@ -559,8 +588,21 @@ class InboundProtocol(asyncio.Protocol):
                 self._peer, len(body), chunked,
             )
 
+            # 无状态认证：头格式、时间戳窗口（±30s）、HMAC 签名。
+            # 此处失败一律不触碰 nonce 表——认证拒绝不消费 nonce。
+            try:
+                auth_ctx = verify_request(
+                    headers, body, self._config.probes)
+            except AuthReject as exc:
+                raise RejectRequest(exc.status, exc.reason) from exc
+
+            # 早期撤销检查：让已撤销探针的请求不必排队即可快速失败。
+            # 真正的权威检查在 nonce 消费事务里（首次写出前再复核一次）。
+            if await self._store.is_revoked(auth_ctx.probe_id):
+                raise RejectRequest(403, "probe has been revoked")
+
             keep_alive = _wants_keep_alive(request.http_version, headers)
-            await self._forward(headers, body, keep_alive)
+            await self._forward(headers, body, keep_alive, auth_ctx)
 
             if not keep_alive:
                 return
@@ -639,90 +681,102 @@ class InboundProtocol(asyncio.Protocol):
         headers: list[tuple[bytes, bytes]],
         body: bytes,
         keep_alive: bool,
+        auth_ctx,
     ) -> None:
-        # 统一截止时刻：从首次发送起 2 秒，期间无论是否重试都不突破该预算。
-        deadline = time.monotonic() + UPSTREAM_TIMEOUT
-        last_exc: Optional[Exception] = None
+        # 排队/建连可能耗时；先拿到上游连接，再在“首次写出前”做权威门控。
+        # 若等待期间探针被撤销，下面的事务会发现 revoked 并拒绝（403），
+        # 已获取的连接原样归还池（门控通过前不写任何字节）。
+        uc = await self._acquire_abortable()
+        gate_passed = False
+        try:
+            try:
+                # 单事务：撤销复核 + nonce 持久消费。COMMIT 后 SQLite 写锁
+                # 立即释放，之后的网络等待不持有任何数据库写锁。
+                await self._store.consume_nonce(
+                    auth_ctx.probe_id, auth_ctx.nonce, auth_ctx.timestamp)
+            except NonceAlreadyConsumed as exc:
+                # 重放：nonce 此前已消费，本次不重复消费、不写出。
+                raise RejectRequest(
+                    409, "nonce already consumed (replay)") from exc
+            except ProbeRevoked as exc:
+                # 排队/建连期间被永久撤销：尚未写出，拒绝。
+                raise RejectRequest(403, "probe has been revoked") from exc
+            except Exception as exc:  # noqa: BLE001 - 存储故障 fail-closed
+                log.exception("auth store failure %s", self._peer)
+                raise RejectRequest(
+                    503, "authentication state unavailable") from exc
+            gate_passed = True
 
-        for attempt in (1, 2):
-            uc = await self._acquire_abortable()
+            # nonce 已持久消费：从此刻起任何失败都不得重发，直接回 5xx。
+            # 2 秒预算从首次向上游写出开始计时。
+            deadline = time.monotonic() + UPSTREAM_TIMEOUT
             exchange_task = asyncio.create_task(exchange_upstream(
-                self._pool, uc, b"POST", b"/events", headers, body))
+                self._pool, uc, b"POST", b"/events", headers, body,
+                strip_auth=True))
             closed_task = asyncio.create_task(self._closed_event.wait())
             timed_out = False
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                try:
+                    async with asyncio.timeout(UPSTREAM_TIMEOUT):
+                        await asyncio.wait(
+                            {exchange_task, closed_task},
+                            return_when=asyncio.FIRST_COMPLETED)
+                except (asyncio.TimeoutError, TimeoutError):
                     timed_out = True
-                else:
-                    try:
-                        async with asyncio.timeout(remaining):
-                            await asyncio.wait(
-                                {exchange_task, closed_task},
-                                return_when=asyncio.FIRST_COMPLETED)
-                    except (asyncio.TimeoutError, TimeoutError):
-                        timed_out = True
             finally:
                 closed_task.cancel()
 
-            try:
-                # 1) 客户端先断连：取消交换、销毁上游连接后向上抛 ClientGone。
-                if not exchange_task.done() and self._closed_event.is_set():
-                    exchange_task.cancel()
-                    await _silent_await_cancel(exchange_task)
-                    await self._pool.destroy(uc)
-                    raise ClientGone("client closed during upstream exchange")
-
-                # 2) 交换自身先完成（成功或上游错误），优先采用它的结果。
-                if exchange_task.done() and not timed_out:
-                    try:
-                        status, resp_headers, payload = exchange_task.result()
-                    except UpstreamError as exc:
-                        await self._pool.destroy(uc)
-                        # 首笔失败（死连接/半开/协议错误）：用全新连接在剩余预算内重试一次。
-                        if attempt == 1 and deadline - time.monotonic() > 0:
-                            log.warning(
-                                "upstream exchange failed %s: %s; retrying once",
-                                self._peer, exc)
-                            last_exc = exc
-                            continue
-                        log.warning("upstream ERROR %s: %s; conn destroyed",
-                                    self._peer, exc)
-                        await self._reply_error(
-                            502, b"bad gateway\n", keep_alive=False)
-                        raise CloseAfterReply("502 sent; close inbound") from exc
-                    # 交换恰好完成与客户端断连同拍：响应无法送达，连接仍销毁。
-                    if self._closed_event.is_set():
-                        await self._pool.destroy(uc)
-                        raise ClientGone("client closed right after exchange")
-                    await self._pool.release(uc)
-                    self._reply_upstream(status, resp_headers, payload, keep_alive)
-                    return
-
-                # 3) 超时（含重试后预算耗尽）：取消交换并销毁，迟到响应随连接丢弃。
-                if timed_out:
-                    await _silent_await_cancel(exchange_task)
-                    await self._pool.destroy(uc)
-                    elapsed = (time.monotonic() - (deadline - UPSTREAM_TIMEOUT)) * 1000
-                    log.warning(
-                        "upstream TIMEOUT %s elapsed=%.0fms conn destroyed",
-                        self._peer, elapsed)
-                    await self._reply_error(
-                        504, b"upstream timeout\n", keep_alive=False)
-                    raise CloseAfterReply("504 sent; close inbound")
-
-                # 理论不可达：两任务都未完成且未超时。防御性按上游错误处理。
+            # 1) 客户端先断连：取消交换、销毁上游连接后向上抛 ClientGone。
+            if not exchange_task.done() and self._closed_event.is_set():
+                exchange_task.cancel()
                 await _silent_await_cancel(exchange_task)
                 await self._pool.destroy(uc)
-                raise CloseAfterReply("unexpected wait state; close inbound")
-            finally:
-                if not exchange_task.done():
-                    exchange_task.cancel()
-                    await _silent_await_cancel(exchange_task)
+                raise ClientGone("client closed during upstream exchange")
 
-        # 重试后仍失败（理论上不会走到，防御性兜底）。
-        await self._reply_error(502, b"bad gateway\n", keep_alive=False)
-        raise CloseAfterReply(f"retry exhausted: {last_exc}")
+            # 2) 交换自身先完成（成功或上游错误），优先采用它的结果。
+            if exchange_task.done() and not timed_out:
+                try:
+                    status, resp_headers, payload = exchange_task.result()
+                except UpstreamError as exc:
+                    # 不重试：nonce 已消费，重试可能导致同一事件被写出两次。
+                    await self._pool.destroy(uc)
+                    log.warning(
+                        "upstream ERROR after nonce consumed %s: %s; "
+                        "no retry (nonce not replayed)", self._peer, exc)
+                    await self._reply_error(
+                        502, b"bad gateway\n", keep_alive=False)
+                    raise CloseAfterReply("502 sent; close inbound") from exc
+                # 交换恰好完成与客户端断连同拍：响应无法送达，连接仍销毁。
+                if self._closed_event.is_set():
+                    await self._pool.destroy(uc)
+                    raise ClientGone("client closed right after exchange")
+                await self._pool.release(uc)
+                self._reply_upstream(status, resp_headers, payload, keep_alive)
+                return
+
+            # 3) 超时：取消交换并销毁，迟到响应随连接丢弃；同样不重试。
+            if timed_out:
+                await _silent_await_cancel(exchange_task)
+                await self._pool.destroy(uc)
+                elapsed = (time.monotonic()
+                           - (deadline - UPSTREAM_TIMEOUT)) * 1000
+                log.warning(
+                    "upstream TIMEOUT %s elapsed=%.0fms conn destroyed; "
+                    "nonce stays consumed (no replay)", self._peer, elapsed)
+                await self._reply_error(
+                    504, b"upstream timeout\n", keep_alive=False)
+                raise CloseAfterReply("504 sent; close inbound")
+
+            # 理论不可达：两任务都未完成且未超时。防御性按上游错误处理。
+            await _silent_await_cancel(exchange_task)
+            await self._pool.destroy(uc)
+            raise CloseAfterReply("unexpected wait state; close inbound")
+        finally:
+            if not gate_passed:
+                # 门控失败（撤销/重放/库故障）：连接上未写出任何请求字节，
+                # 可安全归还池供其他探针使用；客户端断连则连接由获取方释放名额。
+                if not uc.closed:
+                    await self._pool.release(uc)
 
     def _reply_upstream(
         self,
@@ -763,25 +817,51 @@ def _wants_keep_alive(http_version: bytes,
 # --------------------------------------------------------------------------- #
 
 
+async def _prune_loop(store: AuthStore) -> None:
+    """周期清理过期 nonce 行；清理失败只记日志，不影响数据转发。"""
+    while True:
+        await asyncio.sleep(PRUNE_INTERVAL_SECONDS)
+        try:
+            removed = await store.prune()
+            if removed:
+                log.info("pruned %d expired nonce rows", removed)
+        except Exception:  # noqa: BLE001
+            log.exception("nonce prune failed")
+
+
 async def serve() -> None:
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        log.error("配置错误，拒绝启动：%s", exc)
+        raise SystemExit(2) from exc
+
+    store = AuthStore(AUTH_DB_PATH, NONCE_RETENTION_SECONDS)
     pool = UpstreamPool(UPSTREAM_HOST, UPSTREAM_PORT, POOL_CAPACITY)
     loop = asyncio.get_running_loop()
+    prune_task = asyncio.create_task(_prune_loop(store))
 
     server = await loop.create_server(
-        lambda: InboundProtocol(pool), LISTEN_HOST, LISTEN_PORT)
+        lambda: InboundProtocol(pool, config, store),
+        LISTEN_HOST, LISTEN_PORT)
     addr = server.sockets[0].getsockname()
-    log.info("proxy listening on %s, upstream=%s:%s, pool=%d, timeout=%.1fs",
-             addr, UPSTREAM_HOST, UPSTREAM_PORT, POOL_CAPACITY, UPSTREAM_TIMEOUT)
+    log.info(
+        "proxy listening on %s, upstream=%s:%s, pool=%d, timeout=%.1fs, "
+        "probes=%d, auth_db=%s",
+        addr, UPSTREAM_HOST, UPSTREAM_PORT, POOL_CAPACITY, UPSTREAM_TIMEOUT,
+        len(config.probes), AUTH_DB_PATH)
 
     try:
         async with server:
             await server.serve_forever()
     finally:
+        prune_task.cancel()
         await pool.aclose()
+        store.close()
 
 
 def main() -> None:

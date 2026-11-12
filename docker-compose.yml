@@ -7,6 +7,13 @@ services:
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "8080"
       LOG_LEVEL: INFO
+      # 探针 ID->密钥（启动固定）；演示密钥见 ./config/probes.json，生产请替换
+      PROBE_CONFIG_FILE: /etc/platform/probes.json
+      AUTH_DB_PATH: /data/auth.db
+      NONCE_RETENTION_SECONDS: "3600"
+    volumes:
+      - ./config/probes.json:/etc/platform/probes.json:ro
+      - auth-data:/data
     ports:
       - "8080:8080"
     depends_on:
@@ -17,7 +24,17 @@ services:
     build: ./upstream
     environment:
       UPSTREAM_MAX_STORED: "200"
+      # 与代理同一份启动配置：管理 API 的合法探针清单与 ADMIN_KEY 来源
+      PROBE_CONFIG_FILE: /etc/platform/probes.json
+      AUTH_DB_PATH: /data/auth.db
+    volumes:
+      - ./config/probes.json:/etc/platform/probes.json:ro
+      - auth-data:/data
     ports:
-      # 暴露到宿主机是为了演示时直接查看“上游实收请求”与 /docs
+      # 暴露到宿主机是为了演示时直接查看“上游实收请求”、/docs 与管理 API
       - "8000:8000"
     restart: unless-stopped
+
+volumes:
+  # 代理与上游共享的持久化卷：撤销状态与 nonce 消费记录，重启不丢
+  auth-data:

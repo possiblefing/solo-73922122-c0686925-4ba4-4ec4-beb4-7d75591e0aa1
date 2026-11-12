@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .venv/
+# 本地运行时的 SQLite 认证状态（compose 中位于命名卷，不入库）
+*.db
+*.db-wal
+*.db-shm
+/data/
